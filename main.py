@@ -13,7 +13,8 @@ def print_menu():
     print("6. Credit (admin)")
     print("7. Debit (admin)")
     print("8. View balance")
-    print("9. Exit")
+    print("9. View transaction history")
+    print("10. Exit")
     print("==========================")
 
 def main():
@@ -97,12 +98,24 @@ def main():
                     print(f"Your balance (in {bank.base_currency}): {balance:.2f}")
 
             elif choice == "9":
+                phone = input("Your phone: ").strip()
+                history = bank.get_transaction_history(phone)
+                if not history:
+                    print("No transactions found.")
+                else:
+                    print(f"\n--- Transaction History for {phone} ---")
+                    print(f"{'Timestamp':<20} | {'Action':<15} | {'Amount':<10} | {'Cur':<4} | {'Details'}")
+                    print("-" * 80)
+                    for t in history:
+                        print(f"{t['timestamp']:<20} | {t['action']:<15} | {t['amount']:<10.2f} | {t['currency']:<4} | {t['details']}")
+
+            elif choice == "10":
                 bank.save_data()
                 print("Goodbye!")
                 break
 
             else:
-                print("Invalid option. Please choose 1-9.")
+                print("Invalid option. Please choose 1-10.")
 
         except ValueError as e:
             print(f"Error: {e}")
