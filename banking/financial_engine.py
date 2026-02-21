@@ -1,6 +1,8 @@
 """
 FinancialEngine – core banking operations, inherits from FindAccount.
 """
+import json
+import os
 from .find_account import FindAccount
 
 class FinancialEngine(FindAccount):
@@ -102,3 +104,31 @@ class FinancialEngine(FindAccount):
         if currency is None or currency == self.base_currency:
             return base_bal
         return self.from_base(base_bal, currency)
+
+    def save_data(self, filename: str = "data.json") -> None:
+        """Serialize balances, contacts, and liquidity to a JSON file."""
+        data = {
+            "balances": self.balances,
+            "contacts": self.contacts,
+            "liquidity": self.liquidity,
+            "base_currency": self.base_currency
+        }
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=4)
+
+    def load_data(self, filename: str = "data.json") -> None:
+        """Restore state from a JSON file if it exists."""
+        if not os.path.exists(filename):
+            return
+
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+            
+            # Map back to internal storage
+            self.balances = data.get("balances", {})
+            self.contacts = data.get("contacts", {})
+            self.liquidity = data.get("liquidity", self.liquidity)
+            self.base_currency = data.get("base_currency", self.base_currency)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load persistence data: {e}")

@@ -23,6 +23,7 @@ def main():
         print("Invalid base currency. Using USD.")
         base = "USD"
     bank = FinancialEngine(base_currency=base)
+    bank.load_data()  # Load existing session if any
 
     while True:
         print_menu()
@@ -33,6 +34,7 @@ def main():
                 phone = input("Phone number: ").strip()
                 name = input("Full name: ").strip()
                 bank.register(phone, name)
+                bank.save_data()
                 print(f"User {name} registered successfully.")
 
             elif choice == "2":
@@ -40,6 +42,7 @@ def main():
                 amount = float(input("Amount: "))
                 currency = input("Currency (USD/EUR/GBP/JPY): ").upper()
                 bank.deposit(phone, amount, currency)
+                bank.save_data()
                 print("Deposit successful.")
 
             elif choice == "3":
@@ -47,6 +50,7 @@ def main():
                 amount = float(input("Amount: "))
                 currency = input("Currency (USD/EUR/GBP/JPY): ").upper()
                 bank.withdraw(phone, amount, currency)
+                bank.save_data()
                 print("Withdrawal successful.")
 
             elif choice == "4":
@@ -55,6 +59,7 @@ def main():
                 to_cur = input("To currency: ").upper()
                 amount = float(input("Amount to exchange: "))
                 bank.exchange(phone, from_cur, to_cur, amount)
+                bank.save_data()
                 print("Exchange successful.")
 
             elif choice == "5":
@@ -63,6 +68,7 @@ def main():
                 amount = float(input("Amount: "))
                 currency = input("Currency (USD/EUR/GBP/JPY): ").upper()
                 bank.transfer(sender, receiver, amount, currency)
+                bank.save_data()
                 print("Transfer successful.")
 
             elif choice == "6":
@@ -70,6 +76,7 @@ def main():
                 amount = float(input("Amount to credit: "))
                 currency = input("Currency: ").upper()
                 bank.credit(phone, amount, currency)
+                bank.save_data()
                 print("Credit successful.")
 
             elif choice == "7":
@@ -77,6 +84,7 @@ def main():
                 amount = float(input("Amount to debit: "))
                 currency = input("Currency: ").upper()
                 bank.debit(phone, amount, currency)
+                bank.save_data()
                 print("Debit successful.")
 
             elif choice == "8":
@@ -89,6 +97,7 @@ def main():
                     print(f"Your balance (in {bank.base_currency}): {balance:.2f}")
 
             elif choice == "9":
+                bank.save_data()
                 print("Goodbye!")
                 break
 
