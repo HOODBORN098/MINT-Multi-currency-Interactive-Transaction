@@ -1,0 +1,19 @@
+# ChainPay v2.0 — Server-side dependencies
+# Install on the laptop that acts as the server:
+#
+#   pip install -r requirements_server.txt
+
+# Core existing deps
+cryptography>=41.0.0
+PyJWT>=2.8.0
+
+# FastAPI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Desktop client HTTP (used in api_client.py via stdlib urllib — no extra install needed)
+# Mobile client HTTP is handled by Flutter's http package — no Python needed
+
+# For PyInstaller packaging of the desktop app
+pyinstaller>=6.0.0

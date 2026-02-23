@@ -1,0 +1,6 @@
+{
+  "api_base_url": "http://127.0.0.1:8443",
+  "verify_ssl": false,
+  "app_name": "ChainPay",
+  "app_version": "2.0.0"
+}
