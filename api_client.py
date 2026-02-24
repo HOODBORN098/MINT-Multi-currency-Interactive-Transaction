@@ -249,3 +249,112 @@ def admin_set_role(user_id: str, role: str) -> dict:
 
 def admin_resolve_flag(flag_id: str) -> dict:
     return _post(f"api/v1/admin/flags/{flag_id}/resolve", {})
+
+# ── M-Pesa Operations ─────────────────────────────────────────────────────────
+
+def mpesa_deposit(phone: str, amount: float) -> dict:
+    """Initiate M-Pesa STK Push deposit."""
+    return _post("api/v1/mpesa/initiate", {"phone": phone, "amount": amount})
+
+
+def mpesa_deposit_status(internal_ref: str) -> dict:
+    """Poll M-Pesa deposit status."""
+    return _get(f"api/v1/mpesa/status/{internal_ref}")
+
+
+def mpesa_history() -> list:
+    """User's M-Pesa deposit history."""
+    return _get("api/v1/mpesa/history")["deposits"]
+
+
+# ── Reversal Operations ───────────────────────────────────────────────────────
+
+def get_reversal_eligible() -> list:
+    """List transactions eligible for reversal."""
+    return _get("api/v1/reversal/eligible")["eligible_transactions"]
+
+
+def request_reversal(tx_id: str, reason: str = "") -> dict:
+    """Submit a reversal request."""
+    return _post("api/v1/reversal/request", {"tx_id": tx_id, "reason": reason})
+
+
+# ── Admin Reversal Operations ─────────────────────────────────────────────────
+
+def admin_get_reversals(include_history: bool = False) -> list:
+    url = f"api/v1/admin/reversals?include_history={str(include_history).lower()}"
+    return _get(url)["reversals"]
+
+
+def admin_approve_reversal(reversal_id: str, note: str = "") -> dict:
+    return _post(f"api/v1/admin/reversals/{reversal_id}/approve", {"note": note})
+
+
+def admin_reject_reversal(reversal_id: str, note: str = "") -> dict:
+    return _post(f"api/v1/admin/reversals/{reversal_id}/reject", {"note": note})
+
+
+def admin_mpesa_transactions(status: str = None, limit: int = 200) -> list:
+    url = f"api/v1/admin/mpesa-transactions?limit={limit}"
+    if status:
+        url += f"&status={status}"
+    return _get(url)["transactions"]
+
+
+def get_help() -> dict:
+    """Fetch help panel content."""
+    return _get("api/v1/help", authenticated=False)
+
+# ── Reversal Operations ───────────────────────────────────────────────────────
+
+def get_eligible_reversals() -> list:
+    """Get transactions eligible for reversal."""
+    return _get("api/v1/reversal/eligible")["eligible_transactions"]
+
+
+def request_reversal(tx_id: str, reason: str = "") -> dict:
+    """Request reversal for a transaction."""
+    return _post("api/v1/reversal/request", {"tx_id": tx_id, "reason": reason})
+
+
+def get_pending_reversals() -> list:
+    """Admin: Get all pending reversal requests."""
+    return _get("api/v1/admin/reversals/pending")["reversals"]
+
+
+def approve_reversal(reversal_id: str, note: str = "") -> dict:
+    """Admin: Approve a reversal request."""
+    return _post(f"api/v1/admin/reversals/{reversal_id}/approve", {"note": note})
+
+
+def reject_reversal(reversal_id: str, note: str = "") -> dict:
+    """Admin: Reject a reversal request."""
+    return _post(f"api/v1/admin/reversals/{reversal_id}/reject", {"note": note})
+
+
+def get_reversal_history(status: str = None) -> list:
+    """Admin: Get reversal history with optional status filter."""
+    url = "api/v1/admin/reversals/history"
+    if status:
+        url += f"?status={status}"
+    return _get(url)["reversals"]
+
+
+def get_transaction_stats() -> dict:
+    """Admin: Get transaction statistics with failure reasons."""
+    return _get("api/v1/admin/transaction-stats")
+
+
+def get_user_by_phone(phone: str) -> dict:
+    """Get user info by phone number (for confirmation)."""
+    return _get(f"api/v1/user/by-phone/{phone}", authenticated=False)
+
+
+def get_notifications() -> list:
+    """Get user notifications."""
+    return _get("api/v1/notifications")["notifications"]
+
+
+def mark_notification_read(notification_id: str) -> dict:
+    """Mark notification as read."""
+    return _post(f"api/v1/notifications/{notification_id}/read", {})

@@ -1,0 +1,28 @@
+{
+  "_comment": "M-Pesa Daraja API Configuration — ChainPay",
+  "_instructions": [
+    "1. Go to https://developer.safaricom.co.ke and create an account.",
+    "2. Create an app to receive Consumer Key and Consumer Secret.",
+    "3. For sandbox: use the default shortcode 174379 and the sandbox passkey below.",
+    "4. Set your callback_url to your ngrok HTTPS URL + /api/v1/mpesa/callback",
+    "5. For production: use your M-Pesa shortcode and real passkey from Safaricom.",
+    "6. NEVER commit this file with real production credentials to git.",
+    "7. Prefer environment variables (MPESA_CONSUMER_KEY etc.) for production."
+  ],
+
+  "environment": "sandbox",
+
+  "consumer_key": "YOUR_SANDBOX_CONSUMER_KEY_HERE",
+  "consumer_secret": "YOUR_SANDBOX_CONSUMER_SECRET_HERE",
+
+  "shortcode": "174379",
+  "passkey": "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919",
+
+  "callback_url": "https://YOUR-NGROK-SUBDOMAIN.ngrok-free.app/api/v1/mpesa/callback",
+
+  "account_ref": "ChainPay",
+  "transaction_desc": "Wallet Deposit",
+
+  "_sandbox_test_phone": "254708374149",
+  "_sandbox_test_note": "Use the Safaricom sandbox simulator at https://developer.safaricom.co.ke/APIs/MpesaExpressSimulate to trigger callbacks."
+}
