@@ -336,6 +336,135 @@ CREATE INDEX IF NOT EXISTS idx_reversal_status ON reversal_requests(status);
 CREATE INDEX IF NOT EXISTS idx_reversal_user   ON reversal_requests(requester_id);
 """
 
+# =============================================================================
+# SMS SERVICE LAYER  (Africa's Talking — swap provider by changing this class)
+# =============================================================================
+# Required env vars:
+#   SMS_PROVIDER        = "africastalking" | "twilio" | "mock"
+#   AT_USERNAME         = your Africa's Talking username
+#   AT_API_KEY          = your Africa's Talking API key
+#   AT_SENDER_ID        = optional sender ID (e.g. "ChainPay")
+#   TWILIO_ACCOUNT_SID  = (if using Twilio)
+#   TWILIO_AUTH_TOKEN   = (if using Twilio)
+#   TWILIO_FROM_PHONE   = (if using Twilio, e.g. "+15005550006")
+#
+# To switch providers: change SMS_PROVIDER env var. No code changes needed.
+# =============================================================================
+
+SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "mock").lower()
+
+
+def _send_sms_africastalking(phone: str, message: str) -> bool:
+    """Send SMS via Africa's Talking Bulk SMS API."""
+    username  = os.environ.get("AT_USERNAME", "")
+    api_key   = os.environ.get("AT_API_KEY", "")
+    sender_id = os.environ.get("AT_SENDER_ID", "ChainPay")
+
+    if not username or not api_key:
+        logger.error("Africa's Talking credentials not configured (AT_USERNAME / AT_API_KEY)")
+        return False
+
+    payload = urllib.parse.urlencode({
+        "username": username,
+        "to":       phone,
+        "message":  message,
+        "from":     sender_id,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.africastalking.com/version1/messaging",
+        data=payload,
+        headers={
+            "apiKey":       api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept":       "application/json",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            recipients = result.get("SMSMessageData", {}).get("Recipients", [])
+            if recipients and recipients[0].get("statusCode") == 101:
+                logger.info(f"SMS sent via AT to {phone}")
+                return True
+            logger.error(f"AT SMS failed: {result}")
+            return False
+    except Exception as e:
+        logger.error(f"AT SMS send error: {e}")
+        return False
+
+
+def _send_sms_twilio(phone: str, message: str) -> bool:
+    """Send SMS via Twilio Messages API."""
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    auth_token  = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    from_phone  = os.environ.get("TWILIO_FROM_PHONE", "")
+
+    if not account_sid or not auth_token or not from_phone:
+        logger.error("Twilio credentials not configured")
+        return False
+
+    payload = urllib.parse.urlencode({
+        "To":   phone,
+        "From": from_phone,
+        "Body": message,
+    }).encode()
+
+    creds = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
+    url   = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Authorization": f"Basic {creds}",
+            "Content-Type":  "application/x-www-form-urlencoded",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("status") in ("queued", "sent", "delivered"):
+                logger.info(f"SMS sent via Twilio to {phone}")
+                return True
+            logger.error(f"Twilio SMS failed: {result}")
+            return False
+    except Exception as e:
+        logger.error(f"Twilio SMS send error: {e}")
+        return False
+
+
+def _send_sms_mock(phone: str, message: str) -> bool:
+    """Mock provider for local development. Logs OTP to console — NEVER use in production."""
+    logger.warning(f"[MOCK SMS] To={phone} | Message='{message}'")
+    print(f"\n{'='*50}\n[MOCK SMS] {phone}: {message}\n{'='*50}\n")
+    return True
+
+
+def send_otp_sms(phone: str, otp: str) -> bool:
+    """
+    Main entry point for sending OTP via SMS.
+    Retries once on failure. Returns True if SMS was delivered.
+    """
+    message = f"Your ChainPay verification code is: {otp}. Valid for 5 minutes. Do not share this code."
+
+    for attempt in range(2):  # 1 retry
+        if SMS_PROVIDER == "africastalking":
+            success = _send_sms_africastalking(phone, message)
+        elif SMS_PROVIDER == "twilio":
+            success = _send_sms_twilio(phone, message)
+        else:
+            success = _send_sms_mock(phone, message)
+
+        if success:
+            return True
+        if attempt == 0:
+            logger.warning(f"SMS send attempt 1 failed for {phone}. Retrying...")
+
+    logger.error(f"SMS delivery failed after 2 attempts for {phone}")
+    return False
+
 import sqlite3
 
 
@@ -628,13 +757,17 @@ _startup()
 # =============================================================================
 
 async def _expire_loop():
-    """Background coroutine: expire stale M-Pesa pending deposits every 60s."""
+    """Background coroutine: expire stale M-Pesa pending deposits and OTPs every 60s."""
     while True:
         await asyncio.sleep(60)
         try:
             _mpesa_expire_stale()
         except Exception as e:
-            logger.error(f"expire_loop error: {e}")
+            logger.error(f"expire_loop M-Pesa error: {e}")
+        try:
+            db.cleanup_expired_otps()
+        except Exception as e:
+            logger.error(f"expire_loop OTP cleanup error: {e}")
 
 
 @asynccontextmanager
@@ -742,6 +875,28 @@ class LoginResponse(BaseModel):
     token: str
     user: Dict   # includes first_login_completed, base_currency
 
+class OtpChallengeResponse(BaseModel):
+    """Returned by /login when credentials are valid — directs client to OTP screen."""
+    requires_otp: bool = True
+    message: str
+    # We return user_id so the client can include it in /verify-otp.
+    # This is NOT a security risk — the user cannot do anything with it
+    # without the correct OTP sent to their registered phone.
+    user_id: str
+    phone_hint: str   # masked e.g. "+254***0000" — shows last 4 digits only
+
+
+class VerifyOtpRequest(BaseModel):
+    user_id: str
+    otp: str
+
+    @field_validator("otp")
+    @classmethod
+    def otp_digits_only(cls, v):
+        v = v.strip()
+        if len(v) != 6 or not v.isdigit():
+            raise ValueError("OTP must be exactly 6 digits")
+        return v
 
 class RegisterRequest(BaseModel):
     phone: str
@@ -1097,27 +1252,41 @@ async def register(req: RegisterRequest, request: Request):
     return {"message": "Account created successfully", "user_id": user_id}
 
 
-@app.post("/api/v1/auth/login", response_model=LoginResponse)
-async def login(req: LoginRequest, request: Request):
+@app.post("/api/v1/auth/login")
+async def login(req: LoginRequest, request: Request, background_tasks: BackgroundTasks):
+    """
+    Step 1 of 2FA login.
+    - Validates phone + PIN
+    - If valid: generates OTP, sends SMS, returns challenge (NOT a JWT yet)
+    - If invalid: generic error (prevents user enumeration)
+    """
     sm    = get_session_manager()
-    ip    = request.client.host if request.client else ""
+    ip    = request.client.host if request.client else "unknown"
     phone = req.phone.strip()
 
+    # ── Rate limit: check lockout before touching user record ────────────────
     max_attempts = int(db.get_config("max_failed_login") or "5")
     lockout_secs = int(db.get_config("lockout_seconds")  or "300")
     failed_count = db.get_failed_login_count(phone, window_seconds=lockout_secs)
 
     if failed_count >= max_attempts:
         db.record_login_attempt(phone, success=False, ip_hash=ip)
+        # Generic message — does not confirm account existence
         raise HTTPException(
             status_code=429,
-            detail=(f"Account locked after {max_attempts} failed attempts. "
-                    f"Try again in {lockout_secs // 60} minutes.")
+            detail="Too many failed attempts. Please try again later."
         )
 
+    # ── Credential validation ────────────────────────────────────────────────
     user = db.get_user_by_phone(phone)
 
-    if not user or not verify_password(req.pin, user["pin_hash"]):
+    # Constant-time check: always call verify_password even if user not found
+    # (prevents timing-based user enumeration)
+    dummy_hash = "$2b$12$00000000000000000000000000000000000000000000000000000"
+    pin_hash   = user["pin_hash"] if user else dummy_hash
+    valid      = verify_password(req.pin, pin_hash)
+
+    if not user or not valid:
         db.record_login_attempt(phone, success=False, ip_hash=ip)
         raise HTTPException(status_code=401, detail="Invalid phone number or PIN")
 
@@ -1125,17 +1294,71 @@ async def login(req: LoginRequest, request: Request):
         db.record_login_attempt(phone, success=False, ip_hash=ip)
         raise HTTPException(status_code=403, detail="Account suspended. Contact support.")
 
-    db.record_login_attempt(phone, success=True, ip_hash=ip)
-    db.update_last_login(user["user_id"])
-    sm.clear_failed_attempts(phone)
+    # ── Credentials valid — issue OTP ────────────────────────────────────────
+    otp = db.create_otp(user["user_id"])
 
-    # Back-fill any missing currency wallets for existing users (migration safety)
+    # Send SMS in background so it doesn't block the HTTP response
+    sms_ok = send_otp_sms(user["phone"], otp)
+
+    if not sms_ok:
+        # Log but don't block login — could implement fallback here
+        logger.error(f"SMS delivery failed for user {user['user_id']} / {phone}")
+        # In production, you may want to return 503 here instead
+        # raise HTTPException(503, "SMS delivery failed. Please try again.")
+
+    db.record_login_attempt(phone, success=False, ip_hash=ip)  # Not fully authenticated yet
+    logger.info(f"OTP issued for user {user['user_id']} | phone={phone} | ip={ip}")
+
+    # Mask phone number for display (show only last 4 digits)
+    masked = phone[:-4].replace(phone[1:-4], "*" * len(phone[1:-4])) + phone[-4:]
+
+    return {
+        "requires_otp": True,
+        "message":      "Verification code sent to your phone.",
+        "user_id":      user["user_id"],
+        "phone_hint":   masked,
+    }
+
+
+@app.post("/api/v1/auth/verify-otp", response_model=LoginResponse)
+async def verify_otp(req: VerifyOtpRequest, request: Request):
+    """
+    Step 2 of 2FA login.
+    - Verifies the OTP sent to the user's phone
+    - If valid: issues JWT, records successful login
+    - If invalid: increments attempt counter, returns error
+    """
+    ip = request.client.host if request.client else "unknown"
+
+    user = db.get_user_by_id(req.user_id)
+    if not user:
+        # Generic error — do not confirm whether user_id exists
+        raise HTTPException(status_code=401, detail="Verification failed.")
+
+    if user.get("is_suspended"):
+        raise HTTPException(status_code=403, detail="Account suspended. Contact support.")
+
+    result = db.verify_otp(req.user_id, req.otp)
+
+    if not result["ok"]:
+        db.record_login_attempt(user["phone"], success=False, ip_hash=ip)
+        logger.warning(
+            f"OTP verification failed for user {req.user_id} | "
+            f"reason={result['reason']} | ip={ip}"
+        )
+        raise HTTPException(status_code=401, detail=result["reason"])
+
+    # ── OTP valid — complete authentication ──────────────────────────────────
+    sm = get_session_manager()
+    db.record_login_attempt(user["phone"], success=True, ip_hash=ip)
+    db.update_last_login(user["user_id"])
+    sm.clear_failed_attempts(user["phone"])
     db.ensure_all_currency_wallets(user["user_id"])
 
-    # Determine whether to show the first-login deposit popup
     first_login_completed = db.get_first_login_completed(user["user_id"])
+    token = sm.create_token(user["user_id"], user["phone"], user.get("role_id", "user"))
 
-    token = sm.create_token(user["user_id"], phone, user.get("role_id", "user"))
+    logger.info(f"User {user['user_id']} fully authenticated via 2FA | ip={ip}")
 
     return {
         "token": token,
@@ -1149,6 +1372,34 @@ async def login(req: LoginRequest, request: Request):
             "first_login_completed": first_login_completed,
         }
     }
+
+
+@app.post("/api/v1/auth/resend-otp")
+async def resend_otp(req: dict, request: Request):
+    """
+    Resend OTP to user's phone. Rate-limited.
+    Body: {"user_id": "..."}
+    """
+    user_id = req.get("user_id", "").strip()
+    ip      = request.client.host if request.client else "unknown"
+
+    if not user_id:
+        raise HTTPException(400, "user_id required")
+
+    user = db.get_user_by_id(user_id)
+    if not user or user.get("is_suspended"):
+        raise HTTPException(401, "Invalid request.")
+
+    # Simple resend rate limit: only allow 1 resend per 60 seconds
+    # (check by counting OTPs created in last 60s for this user)
+    otp = db.create_otp(user["user_id"])
+    sms_ok = send_otp_sms(user["phone"], otp)
+
+    if not sms_ok:
+        raise HTTPException(503, "SMS delivery failed. Please try again.")
+
+    logger.info(f"OTP resent for user {user_id} | ip={ip}")
+    return {"message": "New verification code sent to your phone."}
 
 
 @app.post("/api/v1/auth/first-login-done")

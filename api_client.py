@@ -86,6 +86,8 @@ def login(phone: str, pin: str) -> dict:
     global _token, _current_user
     data          = _post("api/v1/auth/login", {"phone": phone, "pin": pin},
                           authenticated=False)
+    if data.get("requires_otp"):
+        return data
     _token        = data["token"]
     _current_user = data["user"]
     return data["user"]
@@ -97,6 +99,29 @@ def register(phone: str, name: str, pin: str) -> dict:
                  {"phone": phone, "name": name, "pin": pin},
                  authenticated=False)
 
+def verify_otp(user_id: str, otp: str) -> dict:
+    """
+    Step 2 of 2FA login. Submit the OTP received via SMS.
+    Stores the JWT token and returns the user dict on success.
+    Raises RuntimeError on invalid/expired OTP.
+    """
+    global _token, _current_user
+    data          = _post("api/v1/auth/verify-otp",
+                          {"user_id": user_id, "otp": otp},
+                          authenticated=False)
+    _token        = data["token"]
+    _current_user = data["user"]
+    return data["user"]
+
+
+def resend_otp(user_id: str) -> dict:
+    """
+    Request a new OTP be sent to the user's phone.
+    Returns {message: "..."} on success.
+    """
+    return _post("api/v1/auth/resend-otp",
+                 {"user_id": user_id},
+                 authenticated=False)
 
 def change_pin(old_pin: str, new_pin: str) -> dict:
     """Change PIN for the currently logged-in user."""

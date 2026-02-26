@@ -27,6 +27,9 @@ import uuid
 import os
 from typing import Optional, List, Dict, Tuple
 from contextlib import contextmanager
+import hashlib
+import hmac
+import secrets
 
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "chainpay.db")
@@ -153,6 +156,21 @@ CREATE INDEX IF NOT EXISTS idx_suspicious_uid ON suspicious_activity(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_uid      ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_users_phone    ON users(phone);
 CREATE INDEX IF NOT EXISTS idx_users_role     ON users(role_id);
+
+
+CREATE TABLE IF NOT EXISTS otp_verifications (
+    otp_id        TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    otp_hash      TEXT NOT NULL,
+    expires_at    REAL NOT NULL,
+    attempts      INTEGER DEFAULT 0,
+    used          INTEGER DEFAULT 0,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_otp_user    ON otp_verifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_otp_expires ON otp_verifications(expires_at);
 """
 
 # Migration statements run safely with ALTER TABLE … ADD COLUMN IF NOT EXISTS
@@ -781,6 +799,123 @@ def clear_failed_attempts(phone: str):
             "DELETE FROM login_attempts WHERE phone=? AND success=0", (phone,)
         )
 
+
+# ─── OTP Verification ────────────────────────────────────────────────────────
+
+import secrets
+import hmac
+
+OTP_EXPIRY_SECONDS = 300       # 5 minutes
+OTP_MAX_ATTEMPTS   = 3
+
+def _hash_otp(otp: str) -> str:
+    """SHA-256 hash of OTP. Never store plaintext."""
+    return hashlib.sha256(otp.encode()).hexdigest()
+
+def generate_otp() -> str:
+    """Cryptographically secure 6-digit OTP."""
+    return f"{secrets.randbelow(1000000):06d}"
+
+def create_otp(user_id: str) -> str:
+    """
+    Invalidate any existing unused OTPs for this user,
+    create a new hashed OTP record, return the plaintext OTP
+    (caller sends it via SMS and never stores it).
+    """
+    otp       = generate_otp()
+    otp_hash  = _hash_otp(otp)
+    otp_id    = str(uuid.uuid4())
+    now       = time.time()
+    expires   = now + OTP_EXPIRY_SECONDS
+
+    with get_db() as conn:
+        # Invalidate all previous unused OTPs for this user (prevent reuse/replay)
+        conn.execute(
+            "UPDATE otp_verifications SET used=1 WHERE user_id=? AND used=0",
+            (user_id,)
+        )
+        conn.execute(
+            """INSERT INTO otp_verifications
+               (otp_id, user_id, otp_hash, expires_at, attempts, used, created_at)
+               VALUES (?,?,?,?,0,0,?)""",
+            (otp_id, user_id, otp_hash, expires, now)
+        )
+    return otp
+
+
+def verify_otp(user_id: str, otp_input: str) -> dict:
+    """
+    Verify an OTP for a given user.
+    Returns {"ok": True} or {"ok": False, "reason": str}.
+    
+    Security:
+    - Timing-safe comparison
+    - Checks expiry, used status, and attempt limit
+    - Marks as used on success
+    - Increments attempt counter on failure
+    - Locks out after OTP_MAX_ATTEMPTS failures
+    """
+    now = time.time()
+
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT otp_id, otp_hash, expires_at, attempts, used
+               FROM otp_verifications
+               WHERE user_id=? AND used=0
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id,)
+        ).fetchone()
+
+        if not row:
+            return {"ok": False, "reason": "No pending OTP found. Please request a new code."}
+
+        otp_id    = row["otp_id"]
+        otp_hash  = row["otp_hash"]
+        expires   = row["expires_at"]
+        attempts  = row["attempts"]
+        used      = row["used"]
+
+        if used:
+            return {"ok": False, "reason": "OTP already used."}
+
+        if now > expires:
+            conn.execute("UPDATE otp_verifications SET used=1 WHERE otp_id=?", (otp_id,))
+            return {"ok": False, "reason": "OTP has expired. Please request a new code."}
+
+        if attempts >= OTP_MAX_ATTEMPTS:
+            conn.execute("UPDATE otp_verifications SET used=1 WHERE otp_id=?", (otp_id,))
+            return {"ok": False, "reason": "Too many incorrect attempts. Please request a new code."}
+
+        # Timing-safe hash comparison
+        input_hash = _hash_otp(otp_input)
+        match = hmac.compare_digest(otp_hash, input_hash)
+
+        if not match:
+            conn.execute(
+                "UPDATE otp_verifications SET attempts=attempts+1 WHERE otp_id=?",
+                (otp_id,)
+            )
+            remaining = OTP_MAX_ATTEMPTS - (attempts + 1)
+            if remaining <= 0:
+                conn.execute("UPDATE otp_verifications SET used=1 WHERE otp_id=?", (otp_id,))
+                return {"ok": False, "reason": "Too many incorrect attempts. Please request a new code."}
+            return {"ok": False, "reason": f"Incorrect OTP. {remaining} attempt(s) remaining."}
+
+        # Valid — mark used
+        conn.execute(
+            "UPDATE otp_verifications SET used=1, attempts=attempts+1 WHERE otp_id=?",
+            (otp_id,)
+        )
+        return {"ok": True}
+
+
+def cleanup_expired_otps():
+    """Delete OTP records older than 1 hour. Call from background task."""
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM otp_verifications WHERE expires_at < ?",
+            (time.time() - 3600,)
+        )
 
 # ─── Notifications ────────────────────────────────────────────────────────────
 

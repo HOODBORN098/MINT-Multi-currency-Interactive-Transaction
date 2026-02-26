@@ -193,6 +193,215 @@ def run_in_thread(func, *args, callback=None):
     threading.Thread(target=runner, daemon=True).start()
 
 
+# ── Refresh System ────────────────────────────────────────────────────────────
+
+class RefreshManager:
+    """
+    Central refresh coordinator for the entire application.
+
+    Design principles:
+    - One active refresh at a time — a Lock prevents concurrent duplicate calls.
+    - Throttle: minimum THROTTLE_MS milliseconds between refreshes per page.
+    - Idempotent: re-entrant calls are silently dropped while a refresh is running.
+    - Page-aware: delegates to the currently visible page's refresh() method.
+    - Thread-safe: all UI mutations are scheduled via Tk.after() on the main thread.
+    """
+
+    THROTTLE_MS = 1500          # minimum ms between successive refreshes
+    SPINNER_FRAMES = ("⟳", "↻", "⟲", "↺")  # ASCII spinner cycle
+
+    def __init__(self, app_ref):
+        self._app        = app_ref       # ChainPayApp instance
+        self._lock       = threading.Lock()
+        self._refreshing = False
+        self._last_ms: dict[str, float] = {}   # page_name → last refresh epoch ms
+        self._button: "RefreshButton | None" = None
+        self._spinner_idx = 0
+        self._spinner_job = None
+
+    def set_button(self, btn: "RefreshButton"):
+        """Register the global RefreshButton so the manager can control it."""
+        self._button = btn
+
+    @property
+    def current_page(self) -> str:
+        return getattr(self._app, "_current_page", "")
+
+    def request_refresh(self):
+        """
+        Public entry point — called by the button or any page that wants a refresh.
+        Drops the request if:
+          (a) another refresh is already in flight, OR
+          (b) the last refresh for this page was within THROTTLE_MS.
+        """
+        page = self.current_page
+        now  = time.monotonic() * 1000
+
+        if self._refreshing:
+            return  # already running — silent drop
+
+        elapsed = now - self._last_ms.get(page, 0)
+        if elapsed < self.THROTTLE_MS:
+            remaining_ms = int(self.THROTTLE_MS - elapsed)
+            # Schedule a retry after the throttle window expires
+            if self._button:
+                self._button.after(remaining_ms + 50, self.request_refresh)
+            return
+
+        self._start_refresh(page)
+
+    def _start_refresh(self, page: str):
+        """Acquire lock, update UI to loading state, dispatch background work."""
+        if not self._lock.acquire(blocking=False):
+            return  # another thread raced us — drop
+        self._refreshing = True
+        self._last_ms[page] = time.monotonic() * 1000
+
+        if self._button:
+            self._button.set_loading(True)
+        self._start_spinner()
+
+        def worker():
+            try:
+                frame = self._app._page_frames.get(page)
+                if frame and hasattr(frame, "refresh"):
+                    frame.refresh()
+            except Exception as exc:
+                print(f"[RefreshManager] Error refreshing page '{page}': {exc}")
+            finally:
+                self._app.after(0, self._finish_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_refresh(self):
+        """Called on the main thread when the refresh worker completes."""
+        self._refreshing = False
+        self._lock.release()
+        self._stop_spinner()
+        if self._button:
+            self._button.set_loading(False)
+
+    # ── Spinner helpers ───────────────────────────────────────────────────────
+
+    def _start_spinner(self):
+        self._spinner_idx = 0
+        self._tick_spinner()
+
+    def _tick_spinner(self):
+        if not self._refreshing:
+            return
+        if self._button:
+            frame = self.SPINNER_FRAMES[self._spinner_idx % len(self.SPINNER_FRAMES)]
+            self._button.update_icon(frame)
+        self._spinner_idx += 1
+        self._spinner_job = self._app.after(180, self._tick_spinner)
+
+    def _stop_spinner(self):
+        if self._spinner_job:
+            try:
+                self._app.after_cancel(self._spinner_job)
+            except Exception:
+                pass
+            self._spinner_job = None
+
+
+class RefreshButton(tk.Frame):
+    """
+    A professional, reusable refresh button that lives in the global header.
+
+    States:
+      idle    — clickable, shows "⟳ Refresh"
+      loading — disabled, shows animated spinner + "Refreshing…"
+
+    The button is a tk.Frame wrapper so we can group the icon label and text
+    label side-by-side while still behaving as a single clickable element.
+    """
+
+    IDLE_BG    = BG_CARD
+    IDLE_FG    = ACCENT
+    ACTIVE_BG  = BG_INPUT
+    LOADING_FG = TEXT_DIM
+
+    def __init__(self, parent, refresh_manager: RefreshManager):
+        super().__init__(parent, bg=BG_PANEL, cursor="hand2")
+        self._manager  = refresh_manager
+        self._loading  = False
+        self._build()
+        refresh_manager.set_button(self)
+
+    def _build(self):
+        # Visible pill frame
+        self._pill = tk.Frame(
+            self, bg=self.IDLE_BG,
+            padx=10, pady=4,
+            relief=tk.FLAT,
+        )
+        self._pill.pack()
+
+        self._icon_var = tk.StringVar(value="⟳")
+        self._text_var = tk.StringVar(value="Refresh")
+
+        self._icon_lbl = tk.Label(
+            self._pill,
+            textvariable=self._icon_var,
+            font=("Helvetica", 11, "bold"),
+            fg=self.IDLE_FG, bg=self.IDLE_BG,
+        )
+        self._icon_lbl.pack(side="left")
+
+        self._text_lbl = tk.Label(
+            self._pill,
+            textvariable=self._text_var,
+            font=FONT_UI,
+            fg=self.IDLE_FG, bg=self.IDLE_BG,
+            padx=4,
+        )
+        self._text_lbl.pack(side="left")
+
+        # Bind clicks to every sub-widget
+        for widget in (self, self._pill, self._icon_lbl, self._text_lbl):
+            widget.bind("<Button-1>", self._on_click)
+            widget.bind("<Enter>",    self._on_enter)
+            widget.bind("<Leave>",    self._on_leave)
+
+    def _on_click(self, _event=None):
+        if not self._loading:
+            self._manager.request_refresh()
+
+    def _on_enter(self, _event=None):
+        if not self._loading:
+            self._pill.config(bg=self.ACTIVE_BG)
+            self._icon_lbl.config(bg=self.ACTIVE_BG)
+            self._text_lbl.config(bg=self.ACTIVE_BG)
+
+    def _on_leave(self, _event=None):
+        bg = self.IDLE_BG
+        self._pill.config(bg=bg)
+        self._icon_lbl.config(bg=bg)
+        self._text_lbl.config(bg=bg)
+
+    def set_loading(self, loading: bool):
+        """Switch between idle and loading visual states."""
+        self._loading = loading
+        if loading:
+            self._text_var.set("Refreshing…")
+            self._icon_var.set("⟳")
+            self._pill.config(bg=self.IDLE_BG)
+            self._icon_lbl.config(fg=self.LOADING_FG, bg=self.IDLE_BG)
+            self._text_lbl.config(fg=self.LOADING_FG, bg=self.IDLE_BG)
+            self.config(cursor="watch")
+        else:
+            self._text_var.set("Refresh")
+            self._icon_var.set("⟳")
+            self._icon_lbl.config(fg=self.IDLE_FG)
+            self._text_lbl.config(fg=self.IDLE_FG)
+            self.config(cursor="hand2")
+
+    def update_icon(self, frame_char: str):
+        """Called by RefreshManager spinner to animate the icon."""
+        self._icon_var.set(frame_char)
+
+
 # ── Login Screen ──────────────────────────────────────────────────────────────
 
 class LoginScreen(tk.Frame):
@@ -269,7 +478,25 @@ class LoginScreen(tk.Frame):
                 if isinstance(result, Exception):
                     self.status.config(text=str(result), fg=RED)
                     return
-                self.update_idletasks()
+
+                # Server responded with OTP challenge
+                if isinstance(result, dict) and result.get("requires_otp"):
+                    user_id    = result["user_id"]
+                    phone_hint = result.get("phone_hint", phone)
+                    # Swap LoginScreen contents with OtpScreen
+                    for w in self.winfo_children():
+                        w.destroy()
+                    OtpScreen(
+                        self,
+                        user_id    = user_id,
+                        phone_hint = phone_hint,
+                        on_success = self.on_login,
+                        on_back    = self._back_to_login,
+                    ).pack(fill="both", expand=True)
+                    return
+
+                # Should not reach here in 2FA mode,
+                # but handle legacy direct-token response gracefully
                 self.on_login(result)
             except Exception:
                 pass
@@ -286,6 +513,175 @@ class LoginScreen(tk.Frame):
             w.destroy()
         self._build()
 
+class OtpScreen(tk.Frame):
+    """
+    Step 2 of login: user enters the 6-digit OTP received via SMS.
+    Shows countdown timer, resend button, and attempt feedback.
+    """
+    OTP_EXPIRY_SECONDS = 300  # Must match server-side OTP_EXPIRY_SECONDS
+
+    def __init__(self, parent, user_id: str, phone_hint: str, on_success, on_back):
+        super().__init__(parent, bg=BG_DARK)
+        self._user_id    = user_id
+        self._phone_hint = phone_hint
+        self._on_success = on_success
+        self._on_back    = on_back
+        self._expires_at = time.time() + self.OTP_EXPIRY_SECONDS
+        self._countdown_job = None
+        self._build()
+        self._tick_countdown()
+
+    def _build(self):
+        outer = tk.Frame(self, bg=BG_DARK)
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(outer, text="⬡ CHAIN PAY", font=("Courier", 20, "bold"),
+                 fg=ACCENT, bg=BG_DARK).pack(pady=(0, 4))
+        tk.Label(outer, text="Two-Factor Verification",
+                 font=FONT_UI_LG, fg=TEXT_MAIN, bg=BG_DARK).pack()
+        tk.Label(outer,
+                 text=f"Enter the 6-digit code sent to {self._phone_hint}",
+                 font=FONT_UI_SM, fg=TEXT_DIM, bg=BG_DARK).pack(pady=(4, 20))
+
+        frm = card(outer, padx=32, pady=32)
+        frm.pack()
+
+        tk.Label(frm, text="VERIFICATION CODE", font=FONT_LABEL,
+                 fg=TEXT_DIM, bg=BG_CARD).pack(anchor="w")
+
+        # Large, centered OTP entry field
+        self.otp_entry = tk.Entry(
+            frm, bg=BG_INPUT, fg=ACCENT,
+            insertbackground=ACCENT, relief=tk.FLAT,
+            font=("Courier", 22, "bold"),
+            width=10, justify="center",
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+        )
+        self.otp_entry.pack(fill="x", pady=(4, 8), ipady=10)
+        self.otp_entry.bind("<Return>", lambda e: self._verify())
+
+        # Countdown timer label
+        self.timer_label = tk.Label(
+            frm, text="", font=FONT_UI_SM, fg=YELLOW, bg=BG_CARD
+        )
+        self.timer_label.pack(pady=(0, 12))
+
+        self.verify_btn = styled_button(frm, "  VERIFY CODE  ", self._verify, "primary")
+        self.verify_btn.pack(fill="x", pady=(0, 8))
+
+        # Resend button — initially disabled for 60s
+        self._resend_cooldown = 60
+        self.resend_btn = styled_button(
+            frm, f"Resend Code (wait {self._resend_cooldown}s)",
+            self._resend, "ghost"
+        )
+        self.resend_btn.config(state="disabled")
+        self.resend_btn.pack(fill="x", pady=(0, 8))
+
+        styled_button(frm, "← Back to Login", self._go_back, "ghost").pack(fill="x")
+
+        self.status = tk.Label(outer, text="", font=FONT_UI_SM, fg=RED, bg=BG_DARK)
+        self.status.pack(pady=8)
+
+        self.otp_entry.focus_set()
+
+    def _tick_countdown(self):
+        """Update countdown timer every second."""
+        remaining = max(0, int(self._expires_at - time.time()))
+        mins, secs = divmod(remaining, 60)
+
+        if remaining > 0:
+            self.timer_label.config(
+                text=f"Code expires in {mins:02d}:{secs:02d}",
+                fg=YELLOW if remaining > 60 else RED
+            )
+        else:
+            self.timer_label.config(text="Code has expired — please resend", fg=RED)
+            self.verify_btn.config(state="disabled")
+
+        # Update resend cooldown
+        if hasattr(self, '_resend_ready_at'):
+            resend_remaining = max(0, int(self._resend_ready_at - time.time()))
+            if resend_remaining > 0:
+                self.resend_btn.config(
+                    state="disabled",
+                    text=f"Resend Code (wait {resend_remaining}s)"
+                )
+            else:
+                self.resend_btn.config(state="normal", text="Resend Code")
+        else:
+            # First 60 seconds — use OTP creation time
+            initial_elapsed = self.OTP_EXPIRY_SECONDS - remaining
+            if initial_elapsed >= 60:
+                self.resend_btn.config(state="normal", text="Resend Code")
+            else:
+                wait = 60 - initial_elapsed
+                self.resend_btn.config(
+                    state="disabled",
+                    text=f"Resend Code (wait {int(wait)}s)"
+                )
+
+        self._countdown_job = self.after(1000, self._tick_countdown)
+
+    def _verify(self):
+        otp = self.otp_entry.get().strip()
+        if len(otp) != 6 or not otp.isdigit():
+            self.status.config(text="Enter the 6-digit code from your SMS", fg=YELLOW)
+            return
+
+        self.verify_btn.config(state="disabled", text="Verifying...")
+        self.status.config(text="", fg=RED)
+        self.update_idletasks()
+
+        def do_verify():
+            return api_client.verify_otp(self._user_id, otp)
+
+        def on_result(result):
+            try:
+                self.verify_btn.config(state="normal", text="  VERIFY CODE  ")
+                if isinstance(result, Exception):
+                    self.status.config(text=str(result), fg=RED)
+                    self.otp_entry.delete(0, tk.END)
+                    return
+                # Cancel countdown — we're done
+                if self._countdown_job:
+                    self.after_cancel(self._countdown_job)
+                self._on_success(result)
+            except Exception:
+                pass
+
+        run_in_thread(do_verify, callback=on_result)
+
+    def _resend(self):
+        self.resend_btn.config(state="disabled", text="Sending...")
+        self.status.config(text="", fg=RED)
+
+        def do_resend():
+            return api_client.resend_otp(self._user_id)
+
+        def on_result(result):
+            try:
+                if isinstance(result, Exception):
+                    self.status.config(text=str(result), fg=RED)
+                    self.resend_btn.config(state="normal", text="Resend Code")
+                    return
+                # Reset expiry and resend cooldown
+                self._expires_at = time.time() + self.OTP_EXPIRY_SECONDS
+                self._resend_ready_at = time.time() + 60
+                self.verify_btn.config(state="normal")
+                self.otp_entry.delete(0, tk.END)
+                self.status.config(text="New code sent!", fg=GREEN)
+                self.otp_entry.focus_set()
+            except Exception:
+                pass
+
+        run_in_thread(do_resend, callback=on_result)
+
+    def _go_back(self):
+        if self._countdown_job:
+            self.after_cancel(self._countdown_job)
+        self._on_back()
 
 class RegisterScreen(tk.Frame):
     def __init__(self, parent, on_back):
@@ -387,9 +783,11 @@ class ChainPayApp(tk.Frame):
 
     def __init__(self, parent, user: dict):
         super().__init__(parent, bg=BG_DARK)
-        self.user      = user
-        self._is_admin = user.get("role") in ("admin", "compliance")
-        self._page_frames = {}
+        self.user            = user
+        self._is_admin       = user.get("role") in ("admin", "compliance")
+        self._page_frames    = {}
+        self._current_page   = "Dashboard"      # tracked for RefreshManager
+        self._refresh_mgr    = RefreshManager(self)
         self._build()
 
         # FIX: Delay deposit prompt longer so UI is fully rendered first
@@ -432,7 +830,7 @@ class ChainPayApp(tk.Frame):
         run_in_thread(_mark_done)
 
     def _refresh_dashboard(self):
-        """Refresh dashboard after deposit."""
+        """Refresh dashboard after deposit (called from first-login flow)."""
         dashboard = self._page_frames.get("Dashboard")
         if dashboard and hasattr(dashboard, "refresh"):
             dashboard.refresh()
@@ -518,6 +916,13 @@ class ChainPayApp(tk.Frame):
         self.clock_label = tk.Label(header, text="", font=FONT_LABEL,
                                      fg=TEXT_DIM, bg=BG_PANEL)
         self.clock_label.pack(side="right", padx=20)
+
+        # ── Global Refresh Button ───────────────────────────────────────────
+        self._refresh_btn = RefreshButton(header, self._refresh_mgr)
+        self._refresh_btn.pack(side="right", padx=(0, 12))
+        # Keyboard shortcut: F5 refreshes the current page
+        self.winfo_toplevel().bind("<F5>", lambda e: self._refresh_mgr.request_refresh())
+
         self._update_clock()
 
         self.page_container = tk.Frame(self.content, bg=BG_DARK)
@@ -544,6 +949,7 @@ class ChainPayApp(tk.Frame):
         if frame is None:
             return
         frame.pack(fill="both", expand=True)
+        self._current_page = page_name          # ← track for RefreshManager
         if hasattr(frame, "on_show"):
             frame.on_show()
         self.header_title.config(text=page_name)
@@ -1195,7 +1601,38 @@ class SendMoneyPage(tk.Frame):
         self.receipt_frame.pack(fill="x", pady=(16, 0))
 
     def on_show(self):
-        pass
+        self.refresh()
+
+    def refresh(self):
+        """
+        Refresh Send Money page data:
+        - Re-fetch wallet balances and update default currency selector
+        - Refresh live exchange rate preview if an amount is already entered
+        Note: recipient phone and note fields are preserved (not cleared).
+        """
+        # Reload available currencies from server so the combobox stays current
+        def fetch():
+            return api_client.get_balances()
+
+        def on_result(wallets):
+            if isinstance(wallets, Exception):
+                return
+            # Update the currency selector to reflect available balances
+            # (does not clear user-entered data)
+            try:
+                nonzero_ccys = [
+                    w["currency"] for w in wallets if w.get("balance", 0) > 0
+                ]
+                all_ccys = SUPPORTED_CURRENCIES[:]
+                # Move nonzero currencies to front for convenience
+                ordered = nonzero_ccys + [c for c in all_ccys if c not in nonzero_ccys]
+                self.currency["values"] = ordered
+            except Exception:
+                pass
+            # Re-trigger fee preview in case balances changed
+            self._update_fee_preview()
+
+        run_in_thread(fetch, callback=on_result)
 
     def _update_fee_preview(self, event=None):
         try:
@@ -1925,6 +2362,36 @@ class SettingsPage(tk.Frame):
 
     def on_show(self):
         pass
+
+    def refresh(self):
+        """
+        Refresh Settings page:
+        - Re-test server connectivity and update status label
+        - Re-sync server URL field in case it was changed elsewhere
+        Preserves any PIN fields the user is actively filling.
+        """
+        current_url = CONFIG.get("api_base_url", "")
+        # Keep the entry in sync if user hasn't edited it
+        try:
+            displayed = self.server_url_entry.get().strip()
+            if displayed != current_url:
+                self.server_url_entry.delete(0, tk.END)
+                self.server_url_entry.insert(0, current_url)
+        except Exception:
+            pass
+
+        self.srv_status.config(text="Testing connection…", fg=TEXT_DIM)
+
+        def test():
+            return api_client.get_fx_rates()
+
+        def on_result(result):
+            if isinstance(result, Exception):
+                self.srv_status.config(text=f"⚠ Server unreachable: {result}", fg=RED)
+            else:
+                self.srv_status.config(text="✓ Server connected", fg=GREEN)
+
+        run_in_thread(test, callback=on_result)
 
 
 # ── Admin Dashboard ───────────────────────────────────────────────────────────
